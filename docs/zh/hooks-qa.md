@@ -2,7 +2,7 @@
 
 > 本文档整理自学习过程中的 Hooks 相关问题，基于本仓库 `s01_agent_loop`、`s02_tool_use`、`s03_permission`、`s04_hooks` 章节及 Claude Code（CC）源码附录说明。与 [Permission 问答](permission-qa.md)、[Validation 问答](validation-qa.md) 互补：Hooks 管「在固定时机插入什么扩展逻辑」。
 >
-> **创建日期**：2026-06-26 · **最后更新**：2026-06-26
+> **创建日期**：2026-06-26 · **最后更新**：2026-06-28
 
 ---
 
@@ -27,6 +27,14 @@
   - [stopHookActive 防无限循环](#stophookactive-防无限循环)
   - [PostToolUse preventContinuation](#posttooluse-preventcontinuation)
   - [教学版刻意简化的部分](#教学版刻意简化的部分)
+- [Q4：能否把 Hooks 理解成 Spring AOP？Registry 和 Callback 又是什么？](#q4能否把-hooks-理解成-spring-aopregistry-和-callback-又是什么)
+  - [Hooks ≈ Agent Runtime 里的 AOP / Interceptor](#hooks--agent-runtime-里的-aop--interceptor)
+  - [Hooks 在 loop 中的切点位置](#hooks-在-loop-中的切点位置)
+  - [切点顺序是固定的，切点逻辑是可插拔的](#切点顺序是固定的切点逻辑是可插拔的)
+  - [Hook registry 是事件到函数列表的路由表](#hook-registry-是事件到函数列表的路由表)
+  - [Hook event 像 enum，但 registry 不止是 enum](#hook-event-像-enum但-registry-不止是-enum)
+  - [Hook callback 是被 runtime 回头调用的普通函数](#hook-callback-是被-runtime-回头调用的普通函数)
+  - [框架作者写死触发点，使用者注册扩展逻辑](#框架作者写死触发点使用者注册扩展逻辑)
 - [参考链接](#参考链接)
 
 ---
@@ -357,6 +365,246 @@ PostToolUse hooks 返回 `preventContinuation: true` 时（`toolHooks.ts:117-130
 
 ---
 
+## Q4：能否把 Hooks 理解成 Spring AOP？Registry 和 Callback 又是什么？
+
+可以。这个类比很有帮助，尤其是从**横切关注点**理解 Hooks 时：
+
+> Spring AOP 是给业务方法挂横切逻辑；Claude Code Hooks 是给 agent loop 的生命周期节点挂横切逻辑。
+
+### Hooks ≈ Agent Runtime 里的 AOP / Interceptor
+
+更精确地说，Claude Code Hooks 更像 **agent runtime 里的 AOP / interceptor 机制**。
+
+| Spring AOP / Interceptor | Claude Code Hooks |
+|--------------------------|-------------------|
+| Join point | 生命周期事件，如 `UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop` |
+| Pointcut / matcher | 事件名或 matcher，如只拦截某类工具调用 |
+| Advice / interceptor callback | hook callback，如 `permission_hook`、`log_hook` |
+| Before advice | `PreToolUse` |
+| After advice | `PostToolUse` |
+| Around advice | 能阻止工具继续执行的 hook |
+| Cross-cutting concern | 权限、日志、安全、审计、上下文注入、清理 |
+
+差别在于：Spring AOP 通常围绕**方法调用**织入；Claude Code Hooks 围绕 **agent 生命周期事件**插入逻辑。
+
+### Hooks 在 loop 中的切点位置
+
+Hooks 不是 loop 里的一个单独步骤，而是分布在几个固定切点上：
+
+```text
+用户输入
+  ↓
+UserPromptSubmit hook
+  ↓
+把用户消息放入 messages
+  ↓
+调用 LLM
+  ↓
+LLM 返回 tool_use?
+  ↓
+PreToolUse hook
+  ↓
+真正执行工具 handler
+  ↓
+PostToolUse hook
+  ↓
+tool_result 放回 messages
+  ↓
+继续下一轮 LLM
+  ↓
+如果 LLM 不再调用工具
+  ↓
+Stop hook
+  ↓
+退出 loop
+```
+
+其中最关键的是 `PreToolUse`：它位于「模型已经表达执行意图」和「runtime 真正执行工具」之间，因此最适合做权限、安全、审计。
+
+### 切点顺序是固定的，切点逻辑是可插拔的
+
+这个链路看上去像 hardcode 运行顺序，这个判断是对的，但要拆成两层：
+
+| 层次 | 是否固定 | 由谁决定 | 含义 |
+|------|----------|----------|------|
+| 生命周期切点顺序 | 固定 | runtime / 框架作者 | 在哪里触发 hook，如工具前、工具后、退出前 |
+| 每个切点运行什么逻辑 | 可插拔 | hook 使用者 / 项目作者 | 注册哪些 callback，如日志、权限、审计 |
+
+也就是说，Hooks 不是让运行顺序完全自由，而是在固定生命周期点提供可插拔扩展。`PostToolUse` 不可能跑在工具执行前，`Stop` 也只能在模型不再请求工具时触发；这些语义本来就应该由 runtime 固定。
+
+教学代码里真正的调度函数是：
+
+```python
+def trigger_hooks(event: str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:
+            return result
+    return None
+```
+
+所以可以记成：
+
+```text
+trigger_hooks = hook 调度器
+event = 当前切点名
+*args = 当前上下文
+callback = 真正执行的扩展逻辑
+```
+
+### Hook registry 是事件到函数列表的路由表
+
+`Hook registry` 可以理解成一个**登记表 / 路由表**：记录「哪个生命周期事件上，要跑哪些 hook 函数」。
+
+```python
+HOOKS = {
+    "UserPromptSubmit": [],
+    "PreToolUse": [],
+    "PostToolUse": [],
+    "Stop": [],
+}
+```
+
+注册后会变成类似：
+
+```python
+HOOKS = {
+    "UserPromptSubmit": [context_inject_hook],
+    "PreToolUse": [permission_hook, log_hook],
+    "PostToolUse": [large_output_hook],
+    "Stop": [summary_hook],
+}
+```
+
+当 loop 跑到工具执行前：
+
+```python
+trigger_hooks("PreToolUse", block)
+```
+
+runtime 就去 registry 查 `PreToolUse` 对应哪些函数，然后按顺序执行。没有 registry 时，loop 里可能会散落：
+
+```python
+permission_hook(block)
+log_hook(block)
+audit_hook(block)
+security_hook(block)
+```
+
+有了 registry，loop 只需要知道：
+
+```python
+trigger_hooks("PreToolUse", block)
+```
+
+新增扩展时只注册新函数，不改 `agent_loop()`。
+
+### Hook event 像 enum，但 registry 不止是 enum
+
+可以把 `HOOKS` 的 key 理解成一个事件 enum 集合，但 registry 不只是 enum。
+
+更精确的模型是：
+
+```text
+enum HookEvent
++
+Map<HookEvent, List<HookFunction>>
++
+每个 HookEvent 对应的参数 / 返回值约定
+```
+
+教学代码没有强类型接口，函数结构由触发时传入什么参数决定：
+
+```python
+trigger_hooks("PreToolUse", block)
+```
+
+所以 `PreToolUse` 的 hook 函数应该接收 `block`：
+
+```python
+def some_hook(block):
+    ...
+```
+
+再比如：
+
+```python
+trigger_hooks("PostToolUse", block, output)
+```
+
+所以 `PostToolUse` 的 hook 函数应该接收 `block, output`：
+
+```python
+def some_hook(block, output):
+    ...
+```
+
+真实 Claude Code 会更 schema 化：每个 event 有明确 JSON 输入、输出和 decision 规则。
+
+### Hook callback 是被 runtime 回头调用的普通函数
+
+`callback` 不等于异步。它的核心含义是：
+
+> 你先把一个函数注册进去，等某个事件发生时，由框架 / runtime 回头调用它。
+
+在教学代码里：
+
+```python
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", log_hook)
+```
+
+`permission_hook` 和 `log_hook` 就是 callback。函数本身很普通，区别只在于调用方式：
+
+| 普通函数调用 | callback |
+|--------------|----------|
+| 你主动写 `permission_hook(block)` | 你先 `register_hook(...)` |
+| 调用时机由当前代码位置决定 | 调用时机由 runtime 事件决定 |
+| 「我现在调用你」 | 「事件发生时系统来调用你」 |
+
+教学版 hook callback 是**同步顺序执行**的：
+
+```python
+for callback in HOOKS[event]:
+    result = callback(*args)
+```
+
+先执行第一个，再执行第二个；如果某个 callback 返回非 `None`，就短路后续逻辑。真实产品里 callback 可以扩展成 shell command、HTTP endpoint、MCP tool 或 async hook，但「callback」这个词本身不要求异步。
+
+### 框架作者写死触发点，使用者注册扩展逻辑
+
+框架何时调用 hook，当然也是框架作者设计和写出来的。在 `s04` 教学代码里，框架作者写了这些固定切点：
+
+```python
+trigger_hooks("UserPromptSubmit", query)
+trigger_hooks("PreToolUse", block)
+trigger_hooks("PostToolUse", block, output)
+trigger_hooks("Stop", messages)
+```
+
+这些位置是固定的。`PreToolUse` 必然在工具执行前触发，`PostToolUse` 必然在工具执行后触发。
+
+但框架作者没有把具体扩展逻辑写死在 loop 里。具体逻辑由使用者注册：
+
+```python
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", log_hook)
+```
+
+以后想增加审计逻辑，只需要：
+
+```python
+register_hook("PreToolUse", audit_hook)
+```
+
+不需要再改 `agent_loop()`。
+
+所以最终可以这样记：
+
+> Hook 机制 = 框架作者预留固定插槽；使用者往插槽里插自己的函数。插槽位置是固定的，插槽里的逻辑是可变的。
+
+---
+
 ## 参考链接
 
 | 主题 | 仓库路径 |
@@ -382,4 +630,4 @@ PostToolUse hooks 返回 `preventContinuation: true` 时（`toolHooks.ts:117-130
 
 ---
 
-*文档版本：2026-06-26*
+*文档版本：2026-06-28（新增 Q4：AOP、registry、callback 与 hardcoded 切点理解）*
